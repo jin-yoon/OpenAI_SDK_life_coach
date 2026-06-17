@@ -1,37 +1,101 @@
+from pydoc import cli
 from openai.types.responses.web_search_tool import UserLocation
 import streamlit as st
 import dotenv
 import asyncio
+from openai import OpenAI
+from pydantic import BaseModel, Field
 from agents import (
     Agent,
     Runner,
     SQLiteSession,
     WebSearchTool,
+    FileSearchTool,
 )
 
 dotenv.load_dotenv()
+client = OpenAI()
 
-st.header("👩🏻‍🏫 Life Coach Agent")
+
+# class Answer(BaseModel):
+#     user_situation: str = Field(
+#         description="User's past records, uploaded files, goals, plans, and previous progress to understand their situation."
+#     )
+#     improvement_point: str = Field(
+#         description="Identify improvement areas based on their history(user_situation)"
+#     )
+#     advice: str = Field(
+#         description="Provide personalized recommendations with Web Search Tool."
+#     )
+
+
+VECTOR_STORE_ID = "vs_6a3234fd3fb881918bb0e451d28d9c5c"
+
+st.title("LIFE COACH AGENT")
+st.caption("     Feel free to ask me anything! - No scams, no tricks😉")
 
 if "agent" not in st.session_state:
     st.session_state["agent"] = Agent(
         name="Life Coach Agent",
-        # instructions="""
-        # 너는 life coach로, user의 삶이 더 나아질 수 있도록 동기부여하는 역할이야.
-        # You have access to the following tools :
-        #     - Web Search Tool : 사용자의 질문의 point를 파악하고, 이에 대한 해결방안을 검색하는 도구(ex. "잠이 안오는데, 어떻게 해야 잘 수 있을까?" -> "잠 잘자는 법" 검색)
-        #                         동기부여, 자기 개발 팁, 습관 형성 조언 등에 대한 답변을 할 때, 우선적으로 web에 검색해서 제공해주고, url은 노출하지 마.
-        # """,
         instructions="""
-        You are a web-based helpful&friendly life coach. 
-        You have access to the following tools:
-            - Web Search Tool : 
-                            - Always use this tool for questions related to self-improvement, habit formation, and motivational content. 
-                              (Example: "How can I wake up early in the morning?" → use web search with the query "how to wake up early.")
-                            - 답변할 때 출처/인용 표시를 하지 말고, 웹을 사용하더라도 자연스럽게 요약만 해줘(웹 검색이 필요하더라도 본문에 citation, 출처 표기, 링크를 넣지 말고, 결과만 간단히 정리해줘.)
+        You are a friendly personal life coach.
+        Your job is to analyze the user's past behavior and provide actionable improvement advice.
+
+        You have access to:
+        1. File Search Tool:
+            - Use this to retrieve the user's personal records, goals, habits, journals, and previous conversations.
+            - Always use this first when the question is related to the user's personal progress.
+
+        2. Web Search Tool:
+            - Use this to find external, up-to-date, evidence-based advice, methods, routines, or strategies.
+            - When you identify an improvement point from user data, you MUST use Web Search to find relevant recommendations.
+
+        Follow this workflow for personal improvement questions:
+
+            Step 1.
+            Analyze the user's personal data using File Search.
+
+            Step 2.
+            Identify:
+            - current status
+            - progress toward goals
+            - problems or patterns
+            - areas for improvement
+
+            Step 3.
+            Search the web for relevant strategies, scientific evidence, expert recommendations, or practical methods related to the identified improvement areas.
+
+            Step 4.
+            Combine both sources:
+            - First explain the user's current situation based on File Search.
+            - Then provide improvement suggestions supported by Web Search results.
+
+            Example:
+
+            User:
+            "How is my exercise goal going?"
+
+            Correct behavior:
+
+            File Search:
+            "Based on your records, you planned to run 3 times per week. Recently you completed 2 sessions per week..."
+
+            Then Web Search:
+            "Research effective methods to maintain running habits..."
+
+            Final answer:
+            "Your current progress is... 
+            To improve consistency, here are strategies based on recent research..."
+
+            Never provide only File Search results when the user asks for advice, improvement, habits, goals, routines, or self-development.
+  
                     """,
         tools=[
             WebSearchTool(),
+            FileSearchTool(
+                vector_store_ids=[VECTOR_STORE_ID],
+                max_num_results=3,
+            ),
         ],
     )
 agent = st.session_state["agent"]
@@ -62,7 +126,7 @@ async def paint_history():
             if message["type"] == "web_search_call":
                 query = message["action"]["queries"][-1]
                 with st.chat_message("ai"):
-                    st.write(f"✅ <{query}> 검색완료")
+                    st.write(f'✅ 검색완료 : "{query}"')
 
 
 def update_status(status_container, event):
@@ -74,6 +138,15 @@ def update_status(status_container, event):
         ),
         "response.web_search_call.searching": (
             "👀 검색 중...",
+            "running",
+        ),
+        "response.file_search_call.completed": ("👍 File Search 완료!", "complete"),
+        "response.file_search_call.in_progress": (
+            "👩‍💻 File Search 시작!",
+            "running",
+        ),
+        "response.file_search_call.searching": (
+            "👀 파악 중...",
             "running",
         ),
         "response.completed": (f"✅ 완료", "complete"),
@@ -103,13 +176,41 @@ async def run_agent(message):
 
 
 prompt = st.chat_input(
-    "당신의 <인생코치>와 상담하세요!",
+    "Consulting with your life coach!", accept_file=True, file_type=["txt", "pdf"]
 )
-
 if prompt:
-    with st.chat_message("human"):
-        st.write(prompt)
-    asyncio.run(run_agent(prompt))
+    for file in prompt.files:
+        if file.type.startswith("text/") or file.type.startswith("pdf/"):
+            with st.chat_message("ai"):
+                with st.status("⏳ Uploading file....") as status:
+                    uploaded_file = client.files.create(
+                        file=(
+                            file.name,
+                            file.getvalue(),
+                        ),
+                        purpose="user_data",
+                    )
+                    status.update(label="⌛️ Attaching file...")
+                    client.vector_stores.files.create(
+                        vector_store_id=VECTOR_STORE_ID,
+                        file_id=uploaded_file.id,
+                    )
+
+                    vector_file = client.vector_stores.files.retrieve(
+                        vector_store_id=VECTOR_STORE_ID,
+                        file_id=uploaded_file.id,
+                    )
+                    while vector_file.status != "completed":
+                        vector_file = client.vector_stores.files.retrieve(
+                            vector_store_id=VECTOR_STORE_ID,
+                            file_id=uploaded_file.id,
+                        )
+                    status.update(label="👍 Uploaded successfully!", state="complete")
+
+    if prompt.text:
+        with st.chat_message("human"):
+            st.write(prompt.text)
+        asyncio.run(run_agent(prompt.text))
 
 reset = st.button("Reset Memory")
 if reset:
