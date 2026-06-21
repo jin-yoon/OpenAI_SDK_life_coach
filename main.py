@@ -1,38 +1,102 @@
-from pydoc import cli
-from openai.types.responses.web_search_tool import UserLocation
 import streamlit as st
 import dotenv
 import asyncio
 from openai import OpenAI
-from pydantic import BaseModel, Field
+import copy
+import base64
 from agents import (
     Agent,
     Runner,
     SQLiteSession,
     WebSearchTool,
     FileSearchTool,
+    ImageGenerationTool,
 )
 
 dotenv.load_dotenv()
 client = OpenAI()
 
-
-# class Answer(BaseModel):
-#     user_situation: str = Field(
-#         description="User's past records, uploaded files, goals, plans, and previous progress to understand their situation."
-#     )
-#     improvement_point: str = Field(
-#         description="Identify improvement areas based on their history(user_situation)"
-#     )
-#     advice: str = Field(
-#         description="Provide personalized recommendations with Web Search Tool."
-#     )
-
-
 VECTOR_STORE_ID = "vs_6a3234fd3fb881918bb0e451d28d9c5c"
 
-st.title("LIFE COACH AGENT")
-st.caption("     Feel free to ask me anything! - No scams, no tricks😉")
+# class FilteredSQLiteSession(SQLiteSession):
+
+#     def __init__(self, session_id: str, database: str):
+#         super().__init__(session_id, database)
+
+#     # 모든 dict/list 내부를 재귀적으로 탐색하면서 제거
+#     def _clean_recursive(self, obj):
+
+#         if isinstance(obj, dict):
+
+#             cleaned = {}
+
+#             for k, v in obj.items():
+
+#                 # 제거할 필드
+#                 if k in ["action", "annotations"]:
+#                     continue
+
+#                 cleaned[k] = self._clean_recursive(v)
+
+#             return cleaned
+
+#         elif isinstance(obj, list):
+
+#             return [self._clean_recursive(item) for item in obj]
+
+#         else:
+#             return obj
+
+#     # 저장 전에 필터링
+#     async def add_items(self, items):
+
+#         cleaned_items = [self._clean_recursive(copy.deepcopy(item)) for item in items]
+
+#         await super().add_items(cleaned_items)
+
+#     # 읽을 때도 한번 더 필터링
+#     async def get_items(self):
+
+#         items = await super().get_items()
+
+#         cleaned_items = [self._clean_recursive(copy.deepcopy(item)) for item in items]
+
+#         return cleaned_items
+
+
+class FilteredSQLiteSession(SQLiteSession):
+
+    def __init__(self, session_id: str, database: str):
+        super().__init__(session_id, database)
+
+    def _remove_action_recursive(self, obj):
+
+        if isinstance(obj, dict):
+
+            cleaned = {
+                k: v for k, v in obj.items() if k not in ["action", "annotations"]
+            }
+
+            return {k: self._remove_action_recursive(v) for k, v in cleaned.items()}
+
+        elif isinstance(obj, list):
+
+            return [self._remove_action_recursive(item) for item in obj]
+
+        else:
+            return obj
+
+    async def get_items(self):
+
+        items = await super().get_items()
+
+        return [self._remove_action_recursive(copy.deepcopy(item)) for item in items]
+
+
+st.title("🌟LIFE COACH AGENT")
+st.caption(
+    "     Feel free to ask me anything! - How to achieve your goal, Tips for self-development, motivation..."
+)
 
 if "agent" not in st.session_state:
     st.session_state["agent"] = Agent(
@@ -63,7 +127,7 @@ if "agent" not in st.session_state:
             - areas for improvement
 
             Step 3.
-            Search the web for relevant strategies, scientific evidence, expert recommendations, or practical methods related to the identified improvement areas.
+            USE WebSearchTool for relevant strategies, scientific evidence, expert recommendations, or practical methods related to the identified improvement areas.
 
             Step 4.
             Combine both sources:
@@ -96,13 +160,24 @@ if "agent" not in st.session_state:
                 vector_store_ids=[VECTOR_STORE_ID],
                 max_num_results=3,
             ),
+            ImageGenerationTool(
+                tool_config={
+                    "type": "image_generation",
+                    "quality": "low",
+                    "output_format": "jpeg",
+                    "moderation": "low",
+                    "partial_images": 1,
+                    "size": "1024x1024",
+                }
+            ),
         ],
     )
+
 agent = st.session_state["agent"]
 
 # initialize session - 최초 1회만 실행
 if "session" not in st.session_state:
-    st.session_state["session"] = SQLiteSession(
+    st.session_state["session"] = FilteredSQLiteSession(
         "chat-history",
         "life-coach-memory.db",
     )
@@ -118,15 +193,27 @@ async def paint_history():
             with st.chat_message(message["role"]):
                 if message["role"] == "user":
                     content = message["content"]
-                    st.write(content)
+                    if isinstance(content, str):
+                        st.write(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if "image_url" in part and part["type"] == "input_image":
+                                st.image(part["image_url"])
                 else:
                     if message["type"] == "message":
                         st.write(message["content"][0]["text"])
         if "type" in message:
-            if message["type"] == "web_search_call":
-                query = message["action"]["queries"][-1]
+            message_type = message["type"]
+            if message_type == "web_search_call":
                 with st.chat_message("ai"):
-                    st.write(f'✅ 검색완료 : "{query}"')
+                    st.write(f"✅ Web search completed!")
+            elif message_type == "file_search_call":
+                with st.chat_message("ai"):
+                    st.write("🗂️Searched your files....")
+            elif message_type == "image_generation_call":
+                image = base64.b64decode(message["result"])
+                with st.chat_message("ai"):
+                    st.image(image)
 
 
 def update_status(status_container, event):
@@ -149,6 +236,14 @@ def update_status(status_container, event):
             "👀 파악 중...",
             "running",
         ),
+        "response.image_generation_call.generating": (
+            "✍️ Drawing image...",
+            "running",
+        ),
+        "response.image_generation_call.in_progress": (
+            "🎨 Drawing image...",
+            "running",
+        ),
         "response.completed": (f"✅ 완료", "complete"),
     }
 
@@ -164,7 +259,11 @@ async def run_agent(message):
     with st.chat_message("ai"):
         status_container = st.status("⏳..", expanded=False)
         text_placeholder = st.empty()
+        image_placeholder = st.empty()
         response = ""
+
+        st.session_state["image_placeholder"] = image_placeholder
+        st.session_state["text_placeholder"] = text_placeholder
 
         stream = Runner.run_streamed(agent, message, session=session)
         async for event in stream.stream_events():
@@ -173,12 +272,20 @@ async def run_agent(message):
                 if event.data.type == "response.output_text.delta":
                     response += event.data.delta
                     text_placeholder.write(response)
+                elif event.data.type == "response.image_generation_call.partial_image":
+                    image = base64.b64decode(event.data.partial_image_b64)
+                    image_placeholder.image(image)
 
 
 prompt = st.chat_input(
     "Consulting with your life coach!", accept_file=True, file_type=["txt", "pdf"]
 )
 if prompt:
+    if "image_placeholder" in st.session_state:
+        st.session_state["image_placeholder"].empty()
+    if "text_placeholder" in st.session_state:
+        st.session_state["text_placeholder"].empty()
+
     for file in prompt.files:
         if file.type.startswith("text/") or file.type.startswith("pdf/"):
             with st.chat_message("ai"):
@@ -215,3 +322,11 @@ if prompt:
 reset = st.button("Reset Memory")
 if reset:
     asyncio.run(session.clear_session())
+
+
+# 챗봇의 메모리를 볼 수 있는 디버깅 사이드바 만들기
+with st.sidebar:
+
+    st.write(
+        asyncio.run(session.get_items())
+    )  # asyncio.run() : event loop를 실행시켜주는 역할
